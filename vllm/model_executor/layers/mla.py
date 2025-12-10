@@ -98,8 +98,16 @@ class MultiHeadLatentAttentionWrapper(CustomOp):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
+            use_mla=True,
+            use_sparse=mla_modules.is_sparse,
+            # MLA Args
+            q_lora_rank=self.q_lora_rank,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            qk_head_dim=self.qk_head_dim,
+            v_head_dim=self.v_head_dim,
             kv_b_proj=self.kv_b_proj,
-            use_sparse=self.is_sparse,
             indexer=self.indexer,
         )
 
@@ -152,8 +160,10 @@ class MultiHeadLatentAttentionWrapper(CustomOp):
                 positions, q[..., self.qk_nope_head_dim :], k_pe
             )
 
+
         if self.indexer and self.is_sparse:
-            _topk_indices = self.indexer(hidden_states, q_c, positions, self.rotary_emb)
+            _topk_indices = self.indexer(hidden_states, q_c, positions,
+                                         self.rotary_emb)
 
         attn_out = self.mla_attn(
             q,

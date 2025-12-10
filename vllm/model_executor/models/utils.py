@@ -13,10 +13,9 @@ from transformers import PretrainedConfig
 from typing_extensions import deprecated
 
 from vllm.config import VllmConfig
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from vllm.distributed import (get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size)
+
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -810,6 +809,13 @@ def fast_topk(
     else:
         # Use topk for efficiency with larger k values
         return torch.topk(values, topk, dim=dim)
+
+
+def get_model_hidden_size(hf_config: PretrainedConfig) -> int:
+    if hasattr(hf_config, "hidden_size"):
+        return hf_config.hidden_size
+    text_config = hf_config.get_text_config()
+    return text_config.hidden_size
 
 
 # Chunk x along the num_tokens axis for sequence parallelism

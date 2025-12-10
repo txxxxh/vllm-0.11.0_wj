@@ -25,6 +25,10 @@ logger = init_logger(__name__)
 class DeepseekV32IndexerBackend(AttentionBackend):
     supported_kernel_block_sizes: ClassVar[list[int | MultipleOf]] = [64]
 
+    @staticmethod
+    def get_metadata_cls() -> type["AttentionMetadata"]:
+        return DeepseekV32IndexerMetadata
+
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
         return [32, 64, 128]
@@ -108,11 +112,11 @@ def kv_spans_from_batches(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Args:
-      start_seq_loc: 1D long tensor [B+1], cumulative counts of
+      start_seq_loc: 1D long tensor [B+1], cumulative counts of 
                      selected tokens per batch.
-            Example: [0, 2, 4, 7] ->
+            Example: [0, 2, 4, 7] -> 
                      batch sizes (selected) [2, 2, 3], N=7 tokens total.
-      seq_len_per_batch: 1D long tensor [B],
+      seq_len_per_batch: 1D long tensor [B], 
                          full sequence length (KV length) of each batch.
                          Example: [5, 9, 4].
 
@@ -186,7 +190,6 @@ def split_prefill_chunks(
         seq_lens_cpu: The sequence lengths of the prefill requests.
         max_prefill_buffer_size: The maximum prefill buffer size.
         reqs_start: The start index of the prefill requests.
-
     Returns:
         A list of tuples of (reqs_start, reqs_end).
     """

@@ -3,6 +3,7 @@
 import ast
 from dataclasses import replace
 from importlib.util import find_spec
+from typing import Optional
 
 import numpy as np
 import torch
@@ -10,6 +11,7 @@ import torch.nn as nn
 
 from vllm.config import (
     CompilationMode,
+    CompilationLevel,
     CUDAGraphMode,
     VllmConfig,
     get_layers_from_vllm_config,
@@ -41,6 +43,7 @@ from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 logger = init_logger(__name__)
 
@@ -71,7 +74,7 @@ class EagleProposer:
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
         # hidden size (e.g., Llama 3.3 70B).
-        self.hidden_size = self.draft_model_config.get_hidden_size()
+        self.hidden_size = self.draft_model_config.get_hiddenSize()
 
         # Multi-modal data support
         self.mm_registry = MULTIMODAL_REGISTRY
@@ -79,12 +82,19 @@ class EagleProposer:
             vllm_config.model_config
         )
 
-        self.attn_metadata_builder: AttentionMetadataBuilder | None = None
-        self.draft_indexer_metadata_builder: AttentionMetadataBuilder | None = None
+        self.attn_metadata_builder: Optional[AttentionMetadataBuilder] = None
+        self.draft_indexer_metadata_builder: Optional[
+            AttentionMetadataBuilder] = None
         self.attn_layer_names: list[str] = []
         self.indexer_layer_names: list[str] = []
 
-        self.use_cuda_graph = False
+        self.use_cuda_graph = (self.vllm_config.compilation_config.level
+                               == CompilationLevel.PIECEWISE and
+                               not self.vllm_config.model_config.enforce_eager
+                               and not self.speculative_config.enforce_eager)
+        self.cudagraph_batch_sizes = list(
+            reversed(
+                self.vllm_config.compilation_config.cudagraph_capture_sizes))
 
         compilation_config = self.vllm_config.compilation_config
         if compilation_config.mode == CompilationMode.VLLM_COMPILE:
@@ -108,8 +118,7 @@ class EagleProposer:
             if self.use_cuda_graph
             else []
         )
-
-        self.use_cuda_graph = self.use_cuda_graph and bool(self.cudagraph_batch_sizes)
+        
         # persistent buffers for cuda graph
         self.input_ids = torch.zeros(
             self.max_num_tokens, dtype=torch.int32, device=device
@@ -243,10 +252,10 @@ class EagleProposer:
         else:
             attn_metadata_builder = self.attn_metadata_builder
 
-        attn_metadata = attn_metadata_builder.build_for_drafting(
-            common_attn_metadata=common_attn_metadata, draft_index=0
-        )
-        # FIXME: support hybrid kv for draft model (remove separate indexer)
+        ubatch_id = dbo_current_ubatch_id()
+        attn_metadata_builder = self.runner.attn_groups[0][0].metadata_builders[ubatch_id]
+        attn_metadata = attn_metadata_builder.build_for_drafting(common_attn_metadata=common_attn_metadata, draft_index=0)
+
         if self.draft_indexer_metadata_builder:
             draft_indexer_metadata = (
                 self.draft_indexer_metadata_builder.build_for_drafting(
@@ -261,13 +270,14 @@ class EagleProposer:
         per_layer_attn_metadata = {}
         for layer_name in self.attn_layer_names:
             per_layer_attn_metadata[layer_name] = attn_metadata
-
-        for layer_name in self.indexer_layer_names:
-            assert draft_indexer_metadata is not None
-            per_layer_attn_metadata[layer_name] = draft_indexer_metadata
+        if self.indexer_layer_names:
+            if draft_indexer_metadata is None:
+                raise RuntimeError("indexer_layer_names present but draft_indexer_metadata is None")
+            for layer_name in self.indexer_layer_names:
+                per_layer_attn_metadata[layer_name] = draft_indexer_metadata    
 
         cudagraph_runtime_mode = CUDAGraphMode.NONE
-        if self.use_cuda_graph and num_tokens <= self.cudagraph_batch_sizes[-1]:
+        if self.use_cuda_graph and self.cudagraph_batch_sizes and num_tokens <= self.cudagraph_batch_sizes[-1]:
             num_input_tokens = self.vllm_config.pad_for_cudagraph(num_tokens)
             cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
         else:

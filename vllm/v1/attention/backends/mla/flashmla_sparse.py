@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional
 
@@ -10,6 +11,7 @@ from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (
     AttentionBackend,
     AttentionLayer,
+    AttentionMetadata,
     MultipleOf,
 )
 from vllm.attention.backends.utils import get_mla_dims
@@ -52,7 +54,15 @@ structured as:
 """
 
 
+
+def _lse2_to_lse(lse_base2: torch.Tensor) -> torch.Tensor:
+    # Convert base-2 LSE to natural-log LSE
+    # Keep FP32 for numerical stability during the merge.
+    return (lse_base2.to(torch.float32) * math.log(2.0))
+
+
 class FlashMLASparseBackend(AttentionBackend):
+
     accept_output_buffer: bool = True
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     supported_kernel_block_sizes: ClassVar[list[int | MultipleOf]] = [64]
@@ -60,7 +70,11 @@ class FlashMLASparseBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "FLASHMLA_SPARSE"
+        return "FLASHMLA_SPARSE_VLLM_V1"
+
+    @staticmethod
+    def get_metadata_cls() -> type[AttentionMetadata]:
+        return FlashMLASparseMetadata
 
     @staticmethod
     def get_builder_cls() -> type["FlashMLASparseMetadataBuilder"]:
@@ -100,6 +114,39 @@ class FlashMLASparseBackend(AttentionBackend):
             return (num_blocks, block_size, 656)
         else:
             return (num_blocks, block_size, head_size)
+
+    @classmethod
+    def get_supported_dtypes(cls) -> list[torch.dtype]:
+        return [torch.bfloat16]
+
+
+@dataclass
+class MLASparsePrefillMetadata:
+    # NOTE(Chen): not call it "FlashMLASparsePrefillMetadata" because
+    # the kernel is not from flashmla
+    block_table: torch.Tensor
+    has_context: bool = False
+    context_lens: Optional[torch.Tensor] = None
+
+
+@dataclass
+class FlashMLASparseDecodeAndContextMetadata:
+    scheduler_metadata: torch.Tensor = None
+    num_splits: torch.Tensor = None
+    cache_lens: torch.Tensor = None
+    prefill_context_lengths: Optional[torch.Tensor] = None
+    prefill_new_k_start_locs: Optional[torch.Tensor] = None
+    dummy_block_table: torch.Tensor = None
+
+    def filter_prefill_indices(
+            self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.prefill_context_lengths is not None
+        prefill_context_lengths = self.prefill_context_lengths.unsqueeze(-1)
+        context_indices = torch.where(indices < prefill_context_lengths,
+                                      indices, -1)
+        new_token_indices = torch.where(indices >= prefill_context_lengths,
+                                        indices - prefill_context_lengths, -1)
+        return context_indices, new_token_indices
 
 
 @dataclass
@@ -191,21 +238,23 @@ def triton_convert_req_index_to_global_index(
     BLOCK_N: int = 128,  # tile width along columns
 ):
     """
-    out[token_id, indice_id] =
-        block_table[req_id[token_id],
-            token_indices[token_id, indice_id] // BLOCK_SIZE] * BLOCK_SIZE
-        + token_indices[token_id, indice_id] % BLOCK_SIZE
-
+    Convert request-local token indices to global block indices.
+    
+    For each token and its sparse attention indices, compute:
+    out[token_id, indice_id] = block_table[req_id[token_id], 
+                                          token_indices[token_id, indice_id] // BLOCK_SIZE] * BLOCK_SIZE + 
+                               token_indices[token_id, indice_id] % BLOCK_SIZE
+    
     Only when token_indices[token_id, indice_id] == -1 do we output -1.
-    For safety, we also output -1 if the derived block_id would be
-        out-of-bounds.
+    For safety, we also output -1 if the derived block_id would be out-of-bounds.
     """
+
     assert req_id.dtype == torch.int32
     assert block_table.dtype == torch.int32
     assert token_indices.dtype == torch.int32
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
     assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
-        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible byBLOCK_N ({BLOCK_N})"
+        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by BLOCK_N ({BLOCK_N})"
     )
 
     num_tokens = req_id.shape[0]

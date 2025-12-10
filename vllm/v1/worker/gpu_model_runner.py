@@ -52,6 +52,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.models.interfaces import (
     SupportsMultiModal,
     is_mixture_of_experts,
@@ -108,7 +109,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
-    SlidingWindowSpec,
+    MLAAttentionSpec,
+                                        SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -3715,19 +3717,40 @@ class GPUModelRunner(
 
         # We currently only microbatch if the number of tokens is
         # over a certain threshold.
-        ubatch_slices, num_tokens_across_dp = coordinate_batch_across_dp(
-            num_tokens_unpadded=total_num_scheduled_tokens,
-            parallel_config=self.vllm_config.parallel_config,
-            allow_microbatching=allow_microbatching,
-            allow_dp_padding=allow_dp_padding,
-            num_tokens_padded=total_num_scheduled_tokens,
-            uniform_decode=uniform_decode,
-            num_scheduled_tokens_per_request=num_scheduled_tokens,
-        )
-        num_tokens_after_padding = num_tokens
-        if num_tokens_across_dp is not None:
-            dp_rank = self.parallel_config.data_parallel_rank
-            num_tokens_after_padding = int(num_tokens_across_dp[dp_rank])
+        if self.parallel_config.enable_dbo and allow_microbatching:
+            ubatch_slices, num_tokens_across_dp = coordinate_batch_across_dp(
+                num_tokens_unpadded=total_num_scheduled_tokens,
+                parallel_config=self.vllm_config.parallel_config,
+                allow_microbatching=allow_microbatching,
+                allow_dp_padding=allow_dp_padding,
+                num_tokens_padded=total_num_scheduled_tokens,
+                uniform_decode=uniform_decode,
+                num_scheduled_tokens_per_request=num_scheduled_tokens,
+            )
+            ubatch_slices, ubatch_num_tokens_after_padding = ubatch_split(
+                num_scheduled_tokens,
+                total_num_scheduled_tokens,
+                total_num_scheduled_tokens,
+                uniform_decode=uniform_decode,
+                vllm_config=self.vllm_config,
+            )
+            # Currently when DBO is enabled `ubatch_split` returns
+            # the num_tokens_after_padding for a single ubatch, but we have 2
+            # TODO(sage,lucas): this is cruft that should be addressed in the
+            # padding refactor.
+            if ubatch_num_tokens_after_padding is not None:
+                num_tokens_after_padding = ubatch_num_tokens_after_padding * 2
+
+        # If we failed to microbatch, currently need to resynchronize
+        # TODO(lucas,sage): we should be able to avoid this second sync by
+        #  refactoring `get_dp_padding_ubatch` and `get_dp_padding` into
+        #  a single `coordinate_batch_across_dp` function.
+        if num_tokens_after_padding is None:
+            num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
+            num_tokens_after_padding = num_tokens + num_pad
+        else:
+            num_tokens_across_dp = num_tokens_after_padding
+            num_tokens_after_padding = int(num_tokens_after_padding[0].item())
 
         attn_metadata: PerLayerAttnMetadata | None = None
 
@@ -3748,26 +3771,59 @@ class GPUModelRunner(
             cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
             self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
             self.query_start_loc.copy_to_gpu()
-
+            
             attn_metadata, _ = self._build_attention_metadata(
                 total_num_scheduled_tokens=num_tokens,
                 max_num_scheduled_tokens=max_query_len,
-                num_reqs=num_reqs,
                 ubatch_slices=ubatch_slices,
                 for_cudagraph_capture=True,
             )
+            
+            for kv_cache_group_id, kv_cache_group_spec in enumerate(
+                    self.kv_cache_config.kv_cache_groups):
+                common_attn_metadata = CommonAttentionMetadata(
+                    query_start_loc=self.query_start_loc.gpu[:num_reqs + 1],
+                    query_start_loc_cpu=self.query_start_loc.cpu[:num_reqs +
+                                                                 1],
+                    seq_lens=self.seq_lens.gpu[:num_reqs],
+                    seq_lens_cpu=self.seq_lens.cpu[:num_reqs],
+                    num_computed_tokens_cpu=self.input_batch.
+                    num_computed_tokens_cpu_tensor[:num_reqs],
+                    num_reqs=num_reqs,
+                    num_actual_tokens=num_tokens,
+                    max_query_len=max_query_len,
+                    max_seq_len=self.max_model_len,
+                    block_table_tensor=self.input_batch.
+                    block_table[kv_cache_group_id].get_device_tensor(num_reqs),
+                    slot_mapping=self.input_batch.block_table[
+                        kv_cache_group_id].slot_mapping.gpu[:num_tokens],
+                    causal=True)
+                for attn_group in self.attn_groups[kv_cache_group_id]:
+                    if ubatch_slices is not None:
+                        common_attn_metadata_list = split_attn_metadata(
+                            ubatch_slices, common_attn_metadata)
+                        for ubid, common_attn_metadata in enumerate(
+                                common_attn_metadata_list):
+                            assert common_attn_metadata.max_query_len == 1
+                            attn_metadata_i = (attn_group\
+                                               .get_metadata_builder(ubatch_id=ubid)\
+                                               .build_for_cudagraph_capture(common_attn_metadata))
+                            for layer_name in attn_group.layer_names:
+                                assert type(attn_metadata) is list
+                                attn_metadata[ubid][
+                                    layer_name] = attn_metadata_i
+                    else:
+                        assert type(attn_metadata) is dict
+                        attn_metadata_i = attn_group.get_metadata_builder()\
+                            .build_for_cudagraph_capture(common_attn_metadata)
+                        for layer_name in attn_group.layer_names:
+                            attn_metadata[layer_name] = attn_metadata_i
 
-        with self.maybe_dummy_run_with_lora(
-            self.lora_config,
-            num_scheduled_tokens,
-            num_sampled_tokens,
-            activate_lora,
-            remove_lora,
-        ):
-            # Make sure padding doesn't exceed max_num_tokens
-            assert num_tokens_after_padding <= self.max_num_tokens
-            model_kwargs = self._init_model_kwargs(num_tokens_after_padding)
-            if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
+        with self.maybe_dummy_run_with_lora(self.lora_config,
+                                            num_scheduled_tokens, remove_lora):
+            model_kwargs = self._init_model_kwargs(num_tokens)
+            if (self.supports_mm_inputs
+                    and not self.model_config.is_encoder_decoder):
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_after_padding]
                 model_kwargs = {
@@ -5061,6 +5117,7 @@ class GPUModelRunner(
         """
         if has_ec_transfer() and get_ec_transfer().is_producer:
             return {}
+        cache_dtype_str = self.vllm_config.cache_config.cache_dtype
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         for layer_name, attn_module in attn_layers.items():
@@ -5076,9 +5133,86 @@ class GPUModelRunner(
                 # or enable more requests to be processed simultaneously.
                 self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
                 continue
-            # Skip modules that don't need KV cache (eg encoder-only attention)
-            if spec := attn_module.get_kv_cache_spec(self.vllm_config):
-                kv_cache_spec[layer_name] = spec
+
+            # TODO(lucas): move the attention specs into the model layers like
+            # the attention backends
+            if attn_module.attn_type == AttentionType.DECODER:
+                if attn_module.sliding_window is not None:
+                    assert not use_mla, "MLA is not supported for sliding" \
+                        "window"
+                    kv_cache_spec[layer_name] = SlidingWindowSpec(
+                        block_size=block_size,
+                        num_kv_heads=attn_module.num_kv_heads,
+                        head_size=attn_module.head_size,
+                        dtype=self.kv_cache_dtype,
+                        sliding_window=attn_module.sliding_window)
+                elif use_mla:
+                    kv_cache_spec[layer_name] = MLAAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=attn_module.num_kv_heads,
+                        head_size=attn_module.head_size,
+                        dtype=self.kv_cache_dtype,
+                        cache_dtype_str=cache_dtype_str)
+                elif self.attention_chunk_size is not None \
+                        and isinstance(attn_module, ChunkedLocalAttention):
+                    kv_cache_spec[layer_name] = ChunkedLocalAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=attn_module.num_kv_heads,
+                        head_size=attn_module.head_size,
+                        dtype=self.kv_cache_dtype,
+                        attention_chunk_size=self.attention_chunk_size)
+                else:
+                    kv_cache_spec[layer_name] = FullAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=attn_module.num_kv_heads,
+                        head_size=attn_module.head_size,
+                        dtype=self.kv_cache_dtype)
+            elif attn_module.attn_type == AttentionType.ENCODER_DECODER:
+                kv_cache_spec[layer_name] = CrossAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=attn_module.num_kv_heads,
+                    head_size=attn_module.head_size,
+                    dtype=self.kv_cache_dtype)
+            elif attn_module.attn_type in (AttentionType.ENCODER,
+                                           AttentionType.ENCODER_ONLY):
+                # encoder-only attention does not need KV cache.
+                continue
+            else:
+                raise ValueError(
+                    f"Unknown attention type: {attn_module.attn_type}")
+
+        mamba_layers = get_layers_from_vllm_config(self.vllm_config, MambaBase)
+        if len(mamba_layers) > 0:
+            if (self.vllm_config.speculative_config is not None
+                    and self.vllm_config.model_config.hf_config.model_type
+                    not in ["qwen3_next"]):
+                raise NotImplementedError(
+                    "Mamba with speculative decoding is not supported yet.")
+            if self.vllm_config.cache_config.enable_prefix_caching:
+                raise NotImplementedError(
+                    "Prefix caching is not supported for Mamba yet.")
+            max_model_len = self.vllm_config.model_config.max_model_len
+
+            page_size_padded = (
+                self.vllm_config.cache_config.mamba_page_size_padded)
+
+            # Set block_size to max_model_len, so that mamba model will always
+            # have only one block in the KV cache.
+            for layer_name, mamba_module in mamba_layers.items():
+                kv_cache_spec[layer_name] = MambaSpec(
+                    shapes=mamba_module.get_state_shape(),
+                    dtypes=mamba_module.get_state_dtype(),
+                    block_size=max_model_len,
+                    page_size_padded=page_size_padded,
+                    mamba_type=mamba_module.mamba_type,
+                    num_speculative_blocks=(
+                        self.speculative_config.num_speculative_tokens
+                        if self.speculative_config else 0),
+                )
+        ds_indexer_layers = get_layers_from_vllm_config(
+            self.vllm_config, DeepseekV32IndexerCache)
+        for layer_name, ds_indexer_module in ds_indexer_layers.items():
+            kv_cache_spec[layer_name] = ds_indexer_module.get_kv_cache_spec()
 
         return kv_cache_spec
 

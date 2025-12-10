@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable, Iterable
+from abc import abstractmethod
+from collections.abc import Iterable
 from contextlib import nullcontext
 from enum import Enum
 from functools import partial

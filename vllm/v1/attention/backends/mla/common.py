@@ -1153,9 +1153,11 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
 
+        # Use the unified attribute set by the base class and the imported
+        # rocm_aiter_ops implementation
         if self.is_aiter_triton_fp8_bmm_enabled:
-            W_K = W_UK.transpose(0, 1)  # 16 512 128
-            W_V = W_UV.permute(1, 2, 0)  # 16 128 512
+            W_K = W_UK.transpose(0, 1)  # (N_heads, L, P)
+            W_V = W_UV.permute(1, 2, 0)  # (N_heads, P, L)
             self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
                 W_K, dtype=current_platform.fp8_dtype()
             )
@@ -1163,11 +1165,9 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                 W_V, dtype=current_platform.fp8_dtype()
             )
 
-            # The kernel operates on non-padded inputs. Hence, pre-compiling
-            # triton kernel to avoid runtime compilation for unseen batch sizes
-            # Pre-compile for batch sizes 1 to 1024 to cover most use-cases.
-            # On DS-R1, this step adds roughly 50s to the model loading time.
-            max_batch_size = 1024  # [ToDo] Find the optimal upper limit
+            # Pre-compile Triton FP8 BMM for common batch sizes to avoid
+            # runtime compilation overhead for unseen batch sizes.
+            max_batch_size = 1024
             pre_compilation_list = list(range(1, max_batch_size + 1))
             if is_global_first_rank():
                 pre_compilation_list = tqdm(
@@ -1363,6 +1363,13 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
     def _run_prefill_new_tokens_cudnn(
         self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
     ):
+        if isinstance(ret, tuple):
+            # Convert from (q_len, num_heads) to (num_heads, q_len)
+            return ret[0], ret[1].transpose(0, 1).contiguous()
+        return ret
+
+    def _run_prefill_new_tokens_cudnn(self, prefill: MLACommonPrefillMetadata,
+                                      q, k, v, return_softmax_lse):
         assert isinstance(prefill, CudnnPrefillMetadata)
         assert prefill.query_seq_lens is not None
         output, lse = cudnn_batch_prefill_with_kv_cache(
@@ -1406,16 +1413,15 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         self, prefill: MLACommonPrefillMetadata, chunk_idx: int, q, k, v
     ):
         assert isinstance(prefill, FlashInferPrefillMetadata)
-
         attn_out, lse = prefill.prefill_chunks[chunk_idx].run(
             q=q,
             k=k,
             v=v,
             return_lse=True,
         )
-
         # Convert from (q_len, num_heads) to (num_heads, q_len)
         return attn_out, lse.transpose(0, 1).contiguous()
+
 
     def _run_prefill_context_chunk_cudnn(
         self, prefill: MLACommonPrefillMetadata, chunk_idx: int, q, k, v
@@ -1565,9 +1571,11 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
 
+        # Use the unified attribute set by the base class and the imported
+        # rocm_aiter_ops implementation
         if self.is_aiter_triton_fp8_bmm_enabled:
-            W_K = W_UK.transpose(0, 1)  # 16 512 128
-            W_V = W_UV.permute(1, 2, 0)  # 16 128 512
+            W_K = W_UK.transpose(0, 1)  # (N_heads, L, P)
+            W_V = W_UV.permute(1, 2, 0)  # (N_heads, P, L)
             self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
                 W_K, dtype=current_platform.fp8_dtype()
             )
@@ -1575,11 +1583,9 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 W_V, dtype=current_platform.fp8_dtype()
             )
 
-            # The kernel operates on non-padded inputs. Hence, pre-compiling
-            # triton kernel to avoid runtime compilation for unseen batch sizes
-            # Pre-compile for batch sizes 1 to 1024 to cover most use-cases.
-            # On DS-R1, this step adds roughly 50s to the model loading time.
-            max_batch_size = 1024  # [ToDo] Find the optimal upper limit
+            # Pre-compile Triton FP8 BMM for common batch sizes to avoid
+            # runtime compilation overhead for unseen batch sizes.
+            max_batch_size = 1024
             pre_compilation_list = list(range(1, max_batch_size + 1))
             if is_global_first_rank():
                 pre_compilation_list = tqdm(
@@ -1673,8 +1679,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                     suffix_output=attn_output,
                     suffix_lse=attn_softmax_lse,
                 )
-                output = output_tmp
-                output_lse = output_lse_tmp
+
 
         return output, output_lse
 

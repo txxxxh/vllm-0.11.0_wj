@@ -47,7 +47,9 @@ SpeculativeMethod = Literal[
     "draft_model",
     "suffix",
     EagleModelTypes,
-]
+, "mtp", "history_rollout"]
+MTP_MODEL_TYPES = ("deepseek_mtp", "mimo_mtp", "glm4_moe_mtp", "ernie_mtp",
+                   "qwen3_next_mtp", "longcat_flash_mtp")
 
 
 @config
@@ -298,6 +300,70 @@ class SpeculativeConfig:
                 self.prompt_lookup_max = self.prompt_lookup_min
 
             # Validate values
+            if self.prompt_lookup_min < 1:
+                raise ValueError(
+                    f"prompt_lookup_min={self.prompt_lookup_min} must be > 0")
+            if self.prompt_lookup_max < 1:
+                raise ValueError(
+                    f"prompt_lookup_max={self.prompt_lookup_max} must be > 0")
+            if self.prompt_lookup_min > self.prompt_lookup_max:
+                raise ValueError(
+                    f"prompt_lookup_min={self.prompt_lookup_min} must "
+                    f"be <= prompt_lookup_max={self.prompt_lookup_max}")
+
+            # TODO: current we still need extract vocab_size from target model
+            # config, in future, we may try refactor it out, and set
+            # draft related config as None here.
+            self.draft_model_config = self.target_model_config
+            self.draft_parallel_config = self.target_parallel_config
+        elif self.method in ("history_rollout", "[history_rollout]"):
+            self.method = "history_rollout"
+            # Set default values if not provided
+            if (self.prompt_lookup_min is None
+                    and self.prompt_lookup_max is None):
+                # TODO(woosuk): Tune these values. They are arbitrarily chosen.
+                self.prompt_lookup_min = 5
+                self.prompt_lookup_max = 5
+            elif self.prompt_lookup_min is None:
+                assert self.prompt_lookup_max is not None
+                self.prompt_lookup_min = self.prompt_lookup_max
+            elif self.prompt_lookup_max is None:
+                assert self.prompt_lookup_min is not None
+                self.prompt_lookup_max = self.prompt_lookup_min
+
+            # Validate values
+            if self.prompt_lookup_min < 1:
+                raise ValueError(
+                    f"prompt_lookup_min={self.prompt_lookup_min} must be > 0")
+            if self.prompt_lookup_max < 1:
+                raise ValueError(
+                    f"prompt_lookup_max={self.prompt_lookup_max} must be > 0")
+            if self.prompt_lookup_min > self.prompt_lookup_max:
+                raise ValueError(
+                    f"prompt_lookup_min={self.prompt_lookup_min} must "
+                    f"be <= prompt_lookup_max={self.prompt_lookup_max}")
+
+            # TODO: current we still need extract vocab_size from target model
+            # config, in future, we may try refactor it out, and set
+            # draft related config as None here.
+            self.draft_model_config = self.target_model_config
+            self.draft_parallel_config = self.target_parallel_config
+        elif self.method in ("history_rollout", "[history_rollout]"):
+            self.method = "history_rollout"
+            # Set default values if not provided
+            if (self.prompt_lookup_min is None
+                    and self.prompt_lookup_max is None):
+                # TODO(woosuk): Tune these values. They are arbitrarily chosen.
+                self.prompt_lookup_min = 5
+                self.prompt_lookup_max = 5
+            elif self.prompt_lookup_min is None:
+                assert self.prompt_lookup_max is not None
+                self.prompt_lookup_min = self.prompt_lookup_max
+            elif self.prompt_lookup_max is None:
+                assert self.prompt_lookup_min is not None
+                self.prompt_lookup_max = self.prompt_lookup_min
+
+            # Validate values
             if self.prompt_lookup_min > self.prompt_lookup_max:
                 raise ValueError(
                     f"prompt_lookup_min={self.prompt_lookup_min} must "
@@ -325,9 +391,12 @@ class SpeculativeConfig:
                     runner="draft",
                     tokenizer=self.target_model_config.tokenizer,
                     tokenizer_mode=self.target_model_config.tokenizer_mode,
-                    trust_remote_code=self.target_model_config.trust_remote_code,
-                    allowed_local_media_path=self.target_model_config.allowed_local_media_path,
-                    allowed_media_domains=self.target_model_config.allowed_media_domains,
+                    trust_remote_code=self.target_model_config.
+                    trust_remote_code,
+                    allowed_local_media_path=self.target_model_config.
+                    allowed_local_media_path,
+                    allowed_media_domains=self.target_model_config.
+                    allowed_media_domains,
                     dtype=self.target_model_config.dtype,
                     seed=self.target_model_config.seed,
                     revision=self.revision,
@@ -355,19 +424,17 @@ class SpeculativeConfig:
                     self.method = "medusa"
                 elif self.draft_model_config.hf_config.model_type == "mlp_speculator":
                     self.method = "mlp_speculator"
-                elif self.draft_model_config.hf_config.model_type in get_args(
-                    MTPModelTypes
-                ):
+                elif (self.draft_model_config.hf_config.model_type
+                      in MTP_MODEL_TYPES):
                     self.method = "mtp"
                     if self.num_speculative_tokens > 1:
                         logger.warning(
-                            "Enabling num_speculative_tokens > 1 will run"
-                            "multiple times of forward on same MTP layer"
-                            ",which may result in lower acceptance rate"
-                        )
-                elif self.draft_model_config.hf_config.model_type in (
-                    "longcat_flash_mtp"
-                ):
+                                "Enabling num_speculative_tokens > 1 will run" \
+                                "multiple times of forward on same MTP layer" \
+                                ",which may result in lower acceptance rate" \
+                            )
+                elif (self.draft_model_config.hf_config.model_type
+                      in ("longcat_flash_mtp")):
                     self.method = "longcat_flash_mtp"
                     if self.num_speculative_tokens > 1:
                         logger.warning(
@@ -381,8 +448,7 @@ class SpeculativeConfig:
                         "Speculative decoding with draft model is not "
                         "supported yet. Please consider using other "
                         "speculative decoding methods such as ngram, medusa, "
-                        "eagle, or mtp."
-                    )
+                        "eagle, or mtp.")
 
                 # Replace hf_config for EAGLE draft_model
                 if self.method in ("eagle", "eagle3"):

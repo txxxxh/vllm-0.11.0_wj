@@ -368,6 +368,7 @@ def test_load_model(
         "target_attn_2": mock.MagicMock(),
     }
     target_indx_layers: dict[str, mock.MagicMock] = {}
+    target_indx_layers: dict[str, mock.MagicMock] = {}
     # Draft model has one extra attention layer compared to target model
     all_attn_layers = {**target_attn_layers, "draft_extra_attn": mock.MagicMock()}
 

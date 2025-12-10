@@ -231,6 +231,7 @@ class Attention(nn.Module, AttentionLayerBase):
         quant_config: QuantizationConfig | None = None,
         logits_soft_cap: float | None = None,
         per_layer_sliding_window: int | None = None,
+        use_sparse: bool = False,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: str | None = None,
@@ -274,6 +275,7 @@ class Attention(nn.Module, AttentionLayerBase):
             self, quant_config, prefix, kv_cache_dtype, calculate_kv_scales
         )
 
+        self.use_sparse = use_sparse
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -292,7 +294,8 @@ class Attention(nn.Module, AttentionLayerBase):
                 use_mla=False,
                 has_sink=self.has_sink,
                 attn_type=attn_type,
-            )
+            ,
+                                                 use_sparse=use_sparse)
         else:
             self.attn_backend = attn_backend
 
@@ -526,46 +529,35 @@ class MultiHeadAttention(nn.Module):
         # to upstream flash attention if available.
         # If vllm native fa is selected, we use it directly.
         use_upstream_fa = False
-
-        self.attn_backend = (
-            backend
-            if backend
-            in {
-                AttentionBackendEnum.TORCH_SDPA,
-                AttentionBackendEnum.XFORMERS,
-                AttentionBackendEnum.PALLAS,
-                AttentionBackendEnum.ROCM_AITER_FA,
-                AttentionBackendEnum.FLASH_ATTN,
-            }
-            else AttentionBackendEnum.TORCH_SDPA
-        )
-
-        self.attn_backend, self._flash_attn_varlen_func = (
-            maybe_get_vit_flash_attn_backend(
-                self.attn_backend,
-                use_upstream_fa,
-                attn_backend_override=attn_backend_override,
-            )
-        )
-
-        if (
-            self.attn_backend == AttentionBackendEnum.XFORMERS
-            and not check_xformers_availability()
-        ):
-            self.attn_backend = AttentionBackendEnum.TORCH_SDPA
-
-        self.is_flash_attn_backend = self.attn_backend in {
-            AttentionBackendEnum.FLASH_ATTN,
-            AttentionBackendEnum.ROCM_AITER_FA,
-        }
-
-        # this condition is just to make sure that the
-        # use_upstream_fa in the log is correct
-        if (
-            current_platform.is_rocm()
-            and self.attn_backend == AttentionBackendEnum.FLASH_ATTN
-        ):
+        if backend != _Backend.FLASH_ATTN and check_upstream_fa_availability(
+                dtype):
+            backend = _Backend.FLASH_ATTN
             use_upstream_fa = True
+
+        if current_platform.is_rocm() or current_platform.is_xpu():
+            # currently, only torch_sdpa is supported on rocm/xpu
+            self.attn_backend = _Backend.TORCH_SDPA
+        else:
+
+            self.attn_backend = backend if backend in {
+                _Backend.TORCH_SDPA,
+                _Backend.XFORMERS,
+                _Backend.PALLAS,
+                _Backend.ROCM_AITER_FA,
+                _Backend.FLASH_ATTN,
+            } else _Backend.TORCH_SDPA
+
+        if (self.attn_backend == _Backend.XFORMERS
+                and not check_xformers_availability()):
+            self.attn_backend = _Backend.TORCH_SDPA
+
+        if self.attn_backend == _Backend.FLASH_ATTN:
+            if use_upstream_fa:
+                from flash_attn import flash_attn_varlen_func
+                self._flash_attn_varlen_func = flash_attn_varlen_func
+            else:
+                from vllm.vllm_flash_attn import flash_attn_varlen_func
+                self._flash_attn_varlen_func = flash_attn_varlen_func
 
         logger.info_once(
             f"MultiHeadAttention attn_backend: {self.attn_backend}, "
@@ -896,12 +888,23 @@ def get_attention_context(
     """
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
+        if attn_metadata is None:
+        return
+    self = forward_context.no_compile_layers[layer_name]
+
     if isinstance(attn_metadata, dict):
         attn_metadata = attn_metadata[layer_name]
     attn_layer: Attention | MLAAttention = forward_context.no_compile_layers[layer_name]
     kv_cache = attn_layer.kv_cache[forward_context.virtual_engine]
     return attn_metadata, attn_layer, kv_cache
 
+
+    # Only calculate if the layer's calculate_kv_scales flag is True
+    # This flag gets set to False after the first forward pass
+    if not self.calculate_kv_scales:
+        return
+
+    self.calc_kv_scales(query, key, value)
 
 @maybe_transfer_kv_layer
 def unified_attention(
@@ -912,6 +915,56 @@ def unified_attention(
 ) -> torch.Tensor:
     attn_metadata, self, kv_cache = get_attention_context(layer_name)
     output = self.impl.forward(self, query, key, value, kv_cache, attn_metadata)
+
+    maybe_save_kv_layer_to_connector(layer_name, kv_cache)
+    return output
+
+def maybe_calc_kv_scales_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="maybe_calc_kv_scales",
+    op_func=maybe_calc_kv_scales,
+    mutates_args=["query", "key", "value"],
+    fake_impl=maybe_calc_kv_scales_fake,
+)
+
+
+def get_attention_context(
+    layer_name: str,
+) -> tuple[dict | object | None, Attention | MLAAttention, torch.Tensor]:
+    """Extract attention context for a given layer.
+
+    This helper function extracts the attention metadata, attention layer
+    instance, and KV cache tensor for a specific layer.
+
+    Args:
+        layer_name: The name/identifier of the attention layer.
+
+    Returns:
+        A tuple containing:
+        - attn_metadata: Attention metadata for this specific layer, or None if
+            no metadata available
+        - attn_layer: The attention layer instance (Attention or MLAAttention)
+        - kv_cache: The KV cache tensor for current virtual engine
+
+        Note: attn_metadata may be None, but attn_layer and kv_cache are always
+        extracted from the forward context.
+    """
+    forward_context: ForwardContext = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    if isinstance(attn_metadata, dict):
+        attn_metadata = attn_metadata[layer_name]
+    self = forward_context.no_compile_layers[layer_name]
+    kv_cache = self.kv_cache[forward_context.virtual_engine]
+    output = self.impl.forward(self, query, key, value, kv_cache,
+                               attn_metadata)
 
     return output
 

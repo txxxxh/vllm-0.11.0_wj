@@ -42,7 +42,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVCacheTensor,
     MLAAttentionSpec,
-    SlidingWindowSpec,
+    MLAAttentionSpec,
+                                        SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats

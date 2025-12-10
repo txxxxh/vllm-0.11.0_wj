@@ -142,8 +142,12 @@ class CpuPlatform(Platform):
         if use_mla:
             raise NotImplementedError("MLA is not supported on CPU.")
         if use_sparse:
-            raise NotImplementedError("Sparse Attention is not supported on CPU.")
-        return AttentionBackendEnum.CPU_ATTN.get_path()
+            raise NotImplementedError(
+                "Sparse Attention is not supported on CPU.")
+        logger.info("Using Torch SDPA backend.")
+        if not use_v1:
+            raise ValueError("CPU backend only supports V1.")
+        return "vllm.v1.attention.backends.cpu_attn.TorchSDPABackend"
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:

@@ -143,6 +143,17 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.gate",
         )
+        self.experts = FusedMoE(num_experts=self.n_routed_experts,
+                                top_k=config.num_experts_per_tok,
+                                hidden_size=config.hidden_size,
+                                intermediate_size=config.moe_intermediate_size,
+                                reduce_results=False,
+                                renormalize=config.norm_topk_prob,
+                                quant_config=quant_config,
+                                prefix=f"{prefix}.experts",
+                                enable_eplb=self.enable_eplb,
+                                num_redundant_experts=self.n_redundant_experts,
+                                is_sequence_parallel=self.is_sequence_parallel)
 
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
@@ -197,13 +208,21 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 hidden_states=hidden_states, router_logits=router_logits
             )
 
+        shared_output = None
         if self.shared_expert is not None:
             final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
 
+        # router_logits: (num_tokens, n_experts)
+        router_logits, _ = self.gate(hidden_states)
+        final_hidden_states = self.experts(hidden_states=hidden_states,
+                                           router_logits=router_logits)
+
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
+
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
-                final_hidden_states, 0
-            )
+                final_hidden_states, 0)
             final_hidden_states = final_hidden_states[:num_tokens]
         elif self.tp_size > 1:
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
@@ -966,7 +985,7 @@ class Qwen3NextModel(nn.Module):
 
         config: Qwen3NextConfig = vllm_config.model_config.hf_config
         parallel_config = vllm_config.parallel_config
-
+        lora_config = vllm_config.lora_config
         eplb_config = parallel_config.eplb_config
         self.num_redundant_experts = eplb_config.num_redundant_experts
 

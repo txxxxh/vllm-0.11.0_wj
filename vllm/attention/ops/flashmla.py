@@ -22,7 +22,6 @@ else:
 if current_platform.is_cuda():
     try:
         import vllm._flashmla_extension_C  # noqa: F401
-
         _flashmla_extension_C_AVAILABLE = True
     except ImportError:
         _flashmla_extension_C_AVAILABLE = False

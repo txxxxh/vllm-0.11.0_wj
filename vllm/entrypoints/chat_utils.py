@@ -14,6 +14,9 @@ from typing import Any, Generic, Literal, TypeAlias, TypeVar, cast
 import jinja2
 import jinja2.ext
 import jinja2.meta
+import jinja2
+import jinja2.ext
+import jinja2.meta
 import jinja2.nodes
 import jinja2.parser
 import jinja2.sandbox
@@ -1584,6 +1587,91 @@ def resolve_chat_template_kwargs(
     return {k: v for k, v in chat_template_kwargs.items() if k in accept_vars}
 
 
+# adapted from https://github.com/huggingface/transformers/blob/v4.56.2/src/transformers/utils/chat_template_utils.py#L398-L412
+# only preserve the parse function used to resolve chat template kwargs
+class AssistantTracker(jinja2.ext.Extension):
+    tags = {"generation"}
+
+    def parse(self, parser: jinja2.parser.Parser) -> jinja2.nodes.CallBlock:
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(["name:endgeneration"], drop_needle=True)
+        call = self.call_method("_generation_support")
+        call_block = jinja2.nodes.CallBlock(call, [], [], body)
+        return call_block.set_lineno(lineno)
+
+
+def resolve_chat_template_kwargs(
+    tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
+    chat_template: str,
+    chat_template_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    fn_kw = {
+        k for k in chat_template_kwargs
+        if supports_kw(tokenizer.apply_chat_template, k, allow_var_kwargs=False)
+    }
+
+    env = jinja2.sandbox.ImmutableSandboxedEnvironment(
+        trim_blocks=True,
+        lstrip_blocks=True,
+        extensions=[AssistantTracker, jinja2.ext.loopcontrols],
+    )
+    parsed_content = env.parse(chat_template)
+    template_vars = jinja2.meta.find_undeclared_variables(parsed_content)
+    return template_vars
+
+
+_cached_resolve_chat_template_kwargs = lru_cache(_resolve_chat_template_kwargs)
+
+
+@lru_cache
+def _get_hf_base_chat_template_params() -> frozenset[str]:
+    # Get standard parameters from HuggingFace's base tokenizer class.
+    # This dynamically extracts parameters from PreTrainedTokenizer's
+    # apply_chat_template method, ensuring compatibility with tokenizers
+    # that use **kwargs to receive standard parameters.
+
+    # Read signature from HF's base class - the single source of truth
+    base_sig = inspect.signature(PreTrainedTokenizer.apply_chat_template)
+    # Exclude VAR_KEYWORD (**kwargs) and VAR_POSITIONAL (*args) placeholders
+    return frozenset(
+        p.name
+        for p in base_sig.parameters.values()
+        if p.kind
+        not in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
+    )
+
+
+def resolve_chat_template_kwargs(
+    tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
+    chat_template: str,
+    chat_template_kwargs: dict[str, Any],
+    raise_on_unexpected: bool = True,
+) -> dict[str, Any]:
+    # We exclude chat_template from kwargs here, because
+    # chat template has been already resolved at this stage
+    unexpected_vars = {"chat_template", "tokenize"}
+    if raise_on_unexpected and (
+        unexpected_in_kwargs := unexpected_vars & chat_template_kwargs.keys()
+    ):
+        raise ValueError(
+            "Found unexpected chat template kwargs from request: "
+            f"{unexpected_in_kwargs}"
+        )
+
+    fn_kw = {
+        k
+        for k in chat_template_kwargs
+        if supports_kw(tokenizer.apply_chat_template, k, allow_var_kwargs=False)
+    }
+    template_vars = _cached_resolve_chat_template_kwargs(chat_template)
+
+    # Allow standard HF parameters even if tokenizer uses **kwargs to receive them
+    hf_base_params = _get_hf_base_chat_template_params()
+
+    accept_vars = (fn_kw | template_vars | hf_base_params) - unexpected_vars
+    return {k: v for k, v in chat_template_kwargs.items() if k in accept_vars}
+
+
 def apply_hf_chat_template(
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
     conversation: list[ConversationMessage],
@@ -1614,6 +1702,11 @@ def apply_hf_chat_template(
     )
 
     try:
+        resolved_kwargs = resolve_chat_template_kwargs(
+            tokenizer=tokenizer,
+            chat_template=hf_chat_template,
+            chat_template_kwargs=kwargs,
+        )
         return tokenizer.apply_chat_template(
             conversation=conversation,  # type: ignore[arg-type]
             tools=tools,  # type: ignore[arg-type]

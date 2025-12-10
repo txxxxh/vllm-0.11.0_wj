@@ -7,6 +7,7 @@ Known Issues:
   test_backend_correctness[mixed_small] when run after
   test_backend_correctness[small_prefill], but passes when run alone.
 """
+from typing import Optional, Union
 
 import pytest
 import torch
@@ -144,6 +145,11 @@ def create_and_prepopulate_kv_cache(
         common_attn_metadata: Common attention metadata
         randomize_blocks: Whether to randomly permute blocks
                           or use sequential order
+        kv_cache_dtype: Optional kv cache dtype string. When set to
+                        "fp8_ds_mla" the cache is populated using the
+                        fp8 DeepSeek MLA layout via concat_and_cache_mla.
+        scale: Scaling factor forwarded to concat_and_cache_mla when the
+               fp8 cache layout is requested.
         kv_cache_dtype: Optional kv cache dtype string. When set to
                         "fp8_ds_mla" the cache is populated using the
                         fp8 DeepSeek MLA layout via concat_and_cache_mla.

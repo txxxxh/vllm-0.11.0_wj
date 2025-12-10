@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+from typing import ClassVar, List, Optional
 
 import torch
 
@@ -12,9 +13,9 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.v1.attention.backends.utils import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
-    CommonAttentionMetadata,
-    make_local_attention_virtual_batches,
-    subclass_attention_backend,
+    AttentionCGSupport, CommonAttentionMetadata,
+   
+    make_local_attention_virtual_batches, subclass_attention_backend,
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
